@@ -1,0 +1,148 @@
+name: Publish the model node image
+
+# Copies ONE checked image, by digest, from the private package
+#   ghcr.io/digon-tech/chaxter-model-node            (where the image is built and checked)
+# to the public package of this repository
+#   ghcr.io/digon-tech/chaxter-images/model-node     (what is pulled without credentials).
+# Nothing is rebuilt: the digest that was checked is the digest that goes public, and a tag that
+# already points at another digest is never moved.
+#
+# WHY THE WRITER LIVES HERE, in the public repository, and not in the private one that builds:
+# GitHub Packages accepts only a personal access token (classic) or a workflow's own GITHUB_TOKEN,
+# and GITHUB_TOKEN publishes only packages associated with the workflow's repository. A GitHub App
+# installation token has no packages permission at all. So the only writer of the public package is
+# this repository's own token, with `packages: write` in this one job; there is no PAT anywhere.
+#
+# READING THE SOURCE: the private package must grant this repository the Read role under
+# "Manage Actions access" in its package settings. Without it the source check below fails first,
+# before anything is written.
+#
+# TIME CAP: unmeasured. The image is about 26 GB unpacked (46 layers); 60 minutes is an estimate.
+# Correct it from the first run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version tag to publish, e.g. 0.2.0-rc.1 (must equal the image's version label)
+        required: true
+        type: string
+      digest:
+        description: Manifest digest of the checked private image, sha256:<64 hex>
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: publish-model-node
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Copy the checked digest to the public package
+    if: github.repository == 'digon-tech/chaxter-images'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      packages: write
+    env:
+      SOURCE: ghcr.io/digon-tech/chaxter-model-node
+      TARGET: ghcr.io/digon-tech/chaxter-images/model-node
+      SOURCE_URL: https://github.com/digon-tech/chaxter-images
+      VERSION: ${{ inputs.version }}
+      DIGEST: ${{ inputs.digest }}
+    steps:
+      - name: Validate the inputs (fail closed)
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::version must look like X.Y.Z or X.Y.Z-pre; got: '${VERSION}'"
+            exit 1
+          fi
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::digest must be sha256:<64 lowercase hex>; got: '${DIGEST}'"
+            exit 1
+          fi
+          command -v skopeo >/dev/null || { echo "::error::skopeo is not on this runner"; exit 1; }
+          skopeo --version
+
+      # The credential lives in a file under RUNNER_TEMP, given on stdin, never on a command line;
+      # the last step removes it whatever happened.
+      - name: Log in to GHCR with this repository's own token
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | skopeo login --authfile "$RUNNER_TEMP/ghcr-auth.json" \
+            -u "$GITHUB_ACTOR" --password-stdin ghcr.io
+
+      - name: Check the source is the checked image
+        run: |
+          set -euo pipefail
+          auth="$RUNNER_TEMP/ghcr-auth.json"
+          if ! skopeo inspect --raw --authfile "$auth" "docker://$SOURCE@$DIGEST" > "$RUNNER_TEMP/source-manifest.json"; then
+            echo "::error::cannot read $SOURCE@$DIGEST. The private package must grant this repository Read under 'Manage Actions access'."
+            exit 1
+          fi
+          got="sha256:$(sha256sum "$RUNNER_TEMP/source-manifest.json" | cut -d' ' -f1)"
+          [ "$got" = "$DIGEST" ] || { echo "::error::source manifest digest $got differs from $DIGEST"; exit 1; }
+          skopeo inspect --authfile "$auth" "docker://$SOURCE@$DIGEST" > "$RUNNER_TEMP/source-config.json"
+          label_version="$(jq -r '.Labels["org.opencontainers.image.version"] // ""' "$RUNNER_TEMP/source-config.json")"
+          label_source="$(jq -r '.Labels["org.opencontainers.image.source"] // ""' "$RUNNER_TEMP/source-config.json")"
+          [ "$label_version" = "$VERSION" ] || { echo "::error::image version label is '$label_version', input is '$VERSION'"; exit 1; }
+          [ "$label_source" = "$SOURCE_URL" ] || { echo "::error::image source label is '$label_source', expected '$SOURCE_URL'"; exit 1; }
+          echo "Source verified: $SOURCE@$DIGEST, version $VERSION."
+
+      # Tags never move: an existing tag on the public package must already be this digest.
+      - name: Refuse to move an existing public tag
+        run: |
+          set -euo pipefail
+          auth="$RUNNER_TEMP/ghcr-auth.json"
+          if skopeo inspect --raw --authfile "$auth" "docker://$TARGET:$VERSION" > "$RUNNER_TEMP/target-before.json" 2>/dev/null; then
+            before="sha256:$(sha256sum "$RUNNER_TEMP/target-before.json" | cut -d' ' -f1)"
+            if [ "$before" != "$DIGEST" ]; then
+              echo "::error::$TARGET:$VERSION already points at $before, not $DIGEST. A published tag is never moved."
+              exit 1
+            fi
+            echo "$TARGET:$VERSION already is $DIGEST; the copy below is a no-op."
+          else
+            echo "$TARGET:$VERSION does not exist yet."
+          fi
+
+      - name: Copy by digest, byte for byte
+        run: |
+          set -euo pipefail
+          skopeo copy --preserve-digests --retry-times 3 \
+            --authfile "$RUNNER_TEMP/ghcr-auth.json" \
+            "docker://$SOURCE@$DIGEST" "docker://$TARGET:$VERSION"
+
+      - name: Check the public tag resolves to the same digest
+        run: |
+          set -euo pipefail
+          skopeo inspect --raw --authfile "$RUNNER_TEMP/ghcr-auth.json" "docker://$TARGET:$VERSION" > "$RUNNER_TEMP/target-after.json"
+          after="sha256:$(sha256sum "$RUNNER_TEMP/target-after.json" | cut -d' ' -f1)"
+          [ "$after" = "$DIGEST" ] || { echo "::error::$TARGET:$VERSION is $after, expected $DIGEST"; exit 1; }
+          echo "Published $TARGET:$VERSION@$DIGEST"
+
+      - name: Log out
+        if: always()
+        run: rm -f "$RUNNER_TEMP/ghcr-auth.json"
+
+      # The proof that matters: an anonymous pull, with no credential at all. A package that landed
+      # private is a RED run, never a green one. Nothing here changes visibility.
+      - name: Prove the anonymous pull
+        run: |
+          set -euo pipefail
+          for _ in 1 2 3; do
+            if skopeo inspect --no-creds --raw "docker://$TARGET@$DIGEST" > "$RUNNER_TEMP/anon.json" 2>"$RUNNER_TEMP/anon.err"; then
+              got="sha256:$(sha256sum "$RUNNER_TEMP/anon.json" | cut -d' ' -f1)"
+              [ "$got" = "$DIGEST" ] || { echo "::error::anonymous manifest is $got, expected $DIGEST"; exit 1; }
+              echo "Anonymous pull works: $TARGET@$DIGEST"
+              exit 0
+            fi
+            sleep 15
+          done
+          cat "$RUNNER_TEMP/anon.err"
+          echo "::error::$TARGET@$DIGEST is published but NOT anonymously pullable: the package is private."
+          exit 1
