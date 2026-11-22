@@ -8,10 +8,11 @@ name: Publish the model node image
 # already points at another digest is never moved.
 #
 # WHY THE WRITER LIVES HERE, in the public repository, and not in the private one that builds:
-# GitHub Packages accepts only a personal access token (classic) or a workflow's own GITHUB_TOKEN,
-# and GITHUB_TOKEN publishes only packages associated with the workflow's repository. A GitHub App
-# installation token has no packages permission at all. So the only writer of the public package is
-# this repository's own token, with `packages: write` in this one job; there is no PAT anywhere.
+# the Container registry documents only two credentials, a personal access token (classic) and a
+# workflow's own GITHUB_TOKEN, and GITHUB_TOKEN publishes only packages associated with the
+# workflow's repository. A GitHub App installation token is not documented as accepted by ghcr.io.
+# So the only writer of the public package is this repository's own token, with `packages: write`
+# in this one job; there is no PAT anywhere.
 #
 # READING THE SOURCE: the private package must grant this repository the Read role under
 # "Manage Actions access" in its package settings. Without it the source check below fails first,
